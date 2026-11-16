@@ -20,6 +20,8 @@ class RenderDMABUFTextureHost;
 }  // namespace mozilla::wr
 
 namespace mozilla::widget {
+class BufferTransaction;
+class WaylandBuffer;
 class WaylandSurfaceLock;
 }  // namespace mozilla::widget
 
@@ -39,7 +41,7 @@ struct LayerState {
   bool mMutatedStackingOrder : 1;
   // Layer placement (size/position/scale etc.) was changed
   bool mMutatedPlacement : 1;
-  // mFrontBuffer was changed and we need to commit it to Wayland compositor
+  // front buffer was changed and we need to commit it to Wayland compositor
   // to show new content.
   bool mMutatedFrontBuffer : 1;
 
@@ -94,9 +96,6 @@ class NativeLayerRootWayland final : public NativeLayerRoot {
   void SetDRMFormat(widget::DRMFormat* aFormat);
 
   void VSyncCallbackHandler(uint32_t aTime, bool aEmulated);
-
-  RefPtr<widget::WaylandBuffer> BorrowExternalBuffer(
-      RefPtr<BufferSurface> aBufferSurface);
 
 #ifdef MOZ_LOGGING
   nsAutoCString GetDebugTag() const;
@@ -172,10 +171,6 @@ class NativeLayerRootWayland final : public NativeLayerRoot {
   // flickering. When unmapped they're moved to mMainThreadUpdateSublayers
   // for final clean up at main thread.
   nsTArray<RefPtr<NativeLayerWayland>> mRemovedSublayers;
-
-  // External buffers (DMABuf) used by the layers.
-  // We want to cache and reuse wl_buffer of external images.
-  nsTArray<widget::WaylandBufferHolder> mExternalBuffers;
 
   // We're between CompositorBeginFrame() / CompositorEndFrame() calls.
   mozilla::Atomic<bool, mozilla::Relaxed> mFrameInProcess{false};
@@ -281,6 +276,7 @@ class NativeLayerWayland : public NativeLayer {
   virtual bool CommitFrontBufferToScreenLocked(
       const widget::WaylandSurfaceLock& aProofOfLock) = 0;
   virtual bool IsFrontBufferChanged() = 0;
+  virtual bool HasFrontBuffer() = 0;
 
  protected:
   ~NativeLayerWayland();
@@ -304,9 +300,6 @@ class NativeLayerWayland : public NativeLayer {
   RefPtr<NativeLayerRootWayland> mRootLayer;
 
   RefPtr<widget::WaylandSurface> mSurface;
-
-  // Final buffer which we attach to WaylandSurface
-  RefPtr<widget::WaylandBuffer> mFrontBuffer;
 
   const bool mIsOpaque = false;
 
@@ -377,8 +370,11 @@ class NativeLayerWaylandRender final : public NativeLayerWayland {
   void ReadBackFrontBuffer(const widget::WaylandSurfaceLock& aProofOfLock);
   bool CommitFrontBufferToScreenLocked(
       const widget::WaylandSurfaceLock& aProofOfLock) override;
+  bool HasFrontBuffer() override { return !!mFrontBuffer; }
 
   const RefPtr<SurfacePoolHandleWayland> mSurfacePoolHandle;
+  // Final buffer which we attach to WaylandSurface
+  RefPtr<widget::WaylandBuffer> mFrontBuffer;
   RefPtr<widget::WaylandBuffer> mInProgressBuffer;
   gfx::IntRegion mDirtyRegion;
 };
@@ -410,12 +406,36 @@ class NativeLayerWaylandExternal final : public NativeLayerWayland {
 
   void DiscardBackbuffersLocked(const widget::WaylandSurfaceLock& aProofOfLock,
                                 bool aForce) override;
-  void FreeUnusedBackBuffers();
   bool CommitFrontBufferToScreenLocked(
       const widget::WaylandSurfaceLock& aProofOfLock) override;
 
+  RefPtr<widget::WaylandBuffer> BorrowExternalBuffer(
+      const widget::WaylandSurfaceLock& aSurfaceLock,
+      RefPtr<BufferSurface> aBufferSurface);
+  void SetBorrowedBufferTransaction(
+      const widget::WaylandSurfaceLock& aSurfaceLock,
+      widget::WaylandBuffer* aWaylandBuffer,
+      widget::BufferTransaction* aTransaction);
+  void PurgeBorrowedBuffers(const widget::WaylandSurfaceLock& aSurfaceLock,
+                            bool aForce);
+  bool HasFrontBuffer() override { return !!mFrontBufferSurface; }
+
+  // Last surface provided by AttachExternalImage(), skip redundant attach.
   uintptr_t mLastSurface = 0;
+
+  // Keep reference to texture host to make SHM textures live
   RefPtr<wr::RenderTextureHost> mTextureHost;
+
+  // Final buffer which we attach to WaylandSurface
+  RefPtr<widget::WaylandBuffer> mFrontBuffer;
+
+  // Surface we build mFrontBuffer from at commit time
+  RefPtr<BufferSurface> mFrontBufferSurface;
+
+  // External buffers (DMABuf) used by this layer.
+  // We want to cache and reuse wl_buffer of external images.
+  constexpr static size_t sMaxWaylandBufferHolders = 30;
+  nsTArray<widget::WaylandBufferHolder> mExternalBuffers;
 };
 
 class NativeLayerRootSnapshotterWayland final
